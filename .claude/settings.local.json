@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__18edd6bb-e80f-468c-9f1d-8484e0bc66ad__diagram_drawing_read_me",
+      "mcp__18edd6bb-e80f-468c-9f1d-8484e0bc66ad__create_shapes"
+    ]
+  }
+}
