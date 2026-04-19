@@ -3,6 +3,7 @@ import Sidebar from './components/Sidebar'
 import Dashboard from './pages/Dashboard'
 import EDA from './pages/EDA'
 import Models from './pages/Models'
+import BatchAnalytics from './pages/BatchAnalytics'
 import Predict from './pages/Predict'
 import Stream from './pages/Stream'
 
@@ -12,6 +13,7 @@ function TopBar() {
     '/': 'Dashboard',
     '/eda': 'EDA Analysis',
     '/models': 'ML Models',
+    '/batch': 'Batch Analytics',
     '/predict': 'Predict',
     '/stream': 'Live Stream',
   }
@@ -165,6 +167,7 @@ export default function App() {
       <Route path="/"        element={<Layout><Dashboard /></Layout>} />
       <Route path="/eda"     element={<Layout><EDA /></Layout>} />
       <Route path="/models"  element={<Layout><Models /></Layout>} />
+      <Route path="/batch"   element={<Layout><BatchAnalytics /></Layout>} />
       <Route path="/predict" element={<Layout><Predict /></Layout>} />
       <Route path="/stream"  element={<Layout><Stream /></Layout>} />
     </Routes>

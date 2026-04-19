@@ -28,6 +28,7 @@ export const getClassDistribution = () => api.get('/eda/class-distribution')
 export const getAmountStats = () => api.get('/eda/amount-stats')
 export const getFeatureCorrelations = () => api.get('/eda/feature-correlations')
 export const getModelMetrics = () => api.get('/models/metrics')
+export const getBatchAnalytics = () => api.get('/batch/analytics')
 export const predictTransaction = (data) => api.post('/predict', data)
 export const trainModels = () => api.post('/models/train')
 

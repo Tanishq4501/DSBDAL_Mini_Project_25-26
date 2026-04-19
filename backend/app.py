@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import random
+import re
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -48,6 +49,7 @@ app.add_middleware(
 BASE_DIR = Path(__file__).parent
 DATA_PATH = BASE_DIR / "data" / "creditcard.csv"
 MODELS_DIR = BASE_DIR / "models"
+HADOOP_OUTPUT_PATH = BASE_DIR / "hadoop-output" / "results.txt"
 KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "").strip()
 KAFKA_STREAM_TOPIC = os.getenv("KAFKA_STREAM_TOPIC", "fraud-transactions").strip()
 KAFKA_STREAM_MAX_MESSAGES = int(os.getenv("KAFKA_STREAM_MAX_MESSAGES", "50"))
@@ -355,6 +357,96 @@ MOCK_MODEL_METRICS: List[Dict[str, Any]] = [
     },
 ]
 
+
+def _parse_hadoop_results(path: Path) -> Optional[Dict[str, Any]]:
+    """
+    Parse reducer output in the format:
+        <class>\t<count>\t<total_amount>\t<avg_amount>
+    Returns None when parsing fails.
+    """
+    if not path.exists():
+        return None
+
+    rows: List[Dict[str, Any]] = []
+    for raw in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+
+        parts = re.split(r"\s+", line)
+        if len(parts) < 4:
+            continue
+
+        try:
+            class_id = int(parts[0])
+            count = int(float(parts[1]))
+            total_amount = float(parts[2])
+            avg_amount = float(parts[3])
+        except ValueError:
+            continue
+
+        label = "fraud" if class_id == 1 else "legitimate"
+        rows.append(
+            {
+                "class": class_id,
+                "label": label,
+                "count": count,
+                "total_amount": round(total_amount, 4),
+                "avg_amount": round(avg_amount, 4),
+            }
+        )
+
+    if not rows:
+        return None
+
+    total_count = sum(r["count"] for r in rows)
+    fraud_count = sum(r["count"] for r in rows if r["class"] == 1)
+    legit_count = total_count - fraud_count
+    total_amount = round(sum(r["total_amount"] for r in rows), 4)
+    fraud_rate_pct = round((fraud_count / total_count) * 100, 4) if total_count else 0.0
+
+    return {
+        "source": "hadoop_output",
+        "rows": rows,
+        "summary": {
+            "total_transactions": total_count,
+            "fraud_transactions": fraud_count,
+            "legitimate_transactions": legit_count,
+            "fraud_rate_pct": fraud_rate_pct,
+            "total_amount": total_amount,
+        },
+    }
+
+
+def _mock_batch_analytics() -> Dict[str, Any]:
+    return {
+        "source": "mock",
+        "rows": [
+            {
+                "class": 1,
+                "label": "fraud",
+                "count": 492,
+                "total_amount": 60127.32,
+                "avg_amount": 122.209,
+            },
+            {
+                "class": 0,
+                "label": "legitimate",
+                "count": 284315,
+                "total_amount": 25102448.11,
+                "avg_amount": 88.2944,
+            },
+        ],
+        "summary": {
+            "total_transactions": 284807,
+            "fraud_transactions": 492,
+            "legitimate_transactions": 284315,
+            "fraud_rate_pct": 0.1727,
+            "total_amount": 25162575.43,
+        },
+        "note": "Hadoop output not found; serving realistic demo values.",
+    }
+
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
@@ -567,6 +659,20 @@ async def model_metrics():
         logger.warning(f"Live evaluation failed: {exc}. Returning mock metrics.")
 
     return {"metrics": MOCK_MODEL_METRICS, "source": "mock"}
+
+
+@app.get("/api/batch/analytics", tags=["Big Data"])
+async def batch_analytics():
+    """
+    Return Hadoop/Spark-style batch analytics summary for UI consumption.
+    Reads reducer output from backend/hadoop-output/results.txt when available.
+    """
+    parsed = _parse_hadoop_results(HADOOP_OUTPUT_PATH)
+    if parsed is not None:
+        parsed["hadoop_output_path"] = str(HADOOP_OUTPUT_PATH)
+        return parsed
+
+    return _mock_batch_analytics()
 
 
 @app.post("/api/predict", tags=["Prediction"])
