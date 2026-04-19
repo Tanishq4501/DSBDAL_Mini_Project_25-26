@@ -1,0 +1,50 @@
+[
+  {
+    "model": "Logistic Regression",
+    "precision": 0.0599,
+    "recall": 0.9184,
+    "f1": 0.1124,
+    "roc_auc": 0.9711,
+    "pr_auc": 0.7136,
+    "tp": 90,
+    "tn": 55451,
+    "fp": 1413,
+    "fn": 8
+  },
+  {
+    "model": "Random Forest",
+    "precision": 0.6269,
+    "recall": 0.8571,
+    "f1": 0.7241,
+    "roc_auc": 0.9803,
+    "pr_auc": 0.8506,
+    "tp": 84,
+    "tn": 56814,
+    "fp": 50,
+    "fn": 14
+  },
+  {
+    "model": "XGBoost",
+    "precision": 0.6935,
+    "recall": 0.8776,
+    "f1": 0.7748,
+    "roc_auc": 0.9782,
+    "pr_auc": 0.8688,
+    "tp": 86,
+    "tn": 56826,
+    "fp": 38,
+    "fn": 12
+  },
+  {
+    "model": "Isolation Forest",
+    "precision": 0.25,
+    "recall": 0.2755,
+    "f1": 0.2621,
+    "roc_auc": 0.9529,
+    "pr_auc": 0.147,
+    "tp": 27,
+    "tn": 56783,
+    "fp": 81,
+    "fn": 71
+  }
+]

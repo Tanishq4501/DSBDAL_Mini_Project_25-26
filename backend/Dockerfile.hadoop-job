@@ -1,0 +1,14 @@
+FROM apache/hadoop:3.4.3
+
+USER root
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends python3 python3-pip bash ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY backend/data /app/data
+COPY backend/src /app/src
+
+CMD ["python3", "-m", "src.hadoop_streaming.submit_job"]

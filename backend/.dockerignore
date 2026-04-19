@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+notebooks/
+reports/
+data/
+models/
+hadoop-output/

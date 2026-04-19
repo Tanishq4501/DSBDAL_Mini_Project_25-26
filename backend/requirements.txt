@@ -1,0 +1,15 @@
+fastapi==0.104.1
+uvicorn==0.24.0
+pandas==2.1.0
+numpy==1.25.2
+matplotlib==3.7.2
+seaborn==0.12.2
+scikit-learn==1.3.0
+imbalanced-learn==0.11.0
+xgboost==1.7.6
+joblib==1.3.2
+plotly==5.15.0
+kafka-python==2.0.2
+websockets==12.0
+python-multipart==0.0.6
+# NOTE: pyspark is intentionally excluded from Docker — install locally or use Google Colab
