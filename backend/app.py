@@ -14,7 +14,9 @@ import logging
 import os
 import random
 import re
+import time
 import uuid
+from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -27,6 +29,135 @@ from fastapi.middleware.cors import CORSMiddleware
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# AWS SES — email fraud alerts
+# ---------------------------------------------------------------------------
+# Set these environment variables to enable email notifications:
+#   AWS_SES_SENDER      verified sender address in SES
+#   AWS_SES_RECIPIENT   comma-separated recipient email(s)
+#   AWS_REGION          SES region (default: us-east-1)
+#   AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY  (or use an IAM role)
+#   SES_ALERT_THROTTLE_SECONDS  min seconds between emails (default: 60)
+# ---------------------------------------------------------------------------
+SES_SENDER    = os.getenv("AWS_SES_SENDER", "").strip()
+SES_RECIPIENT = os.getenv("AWS_SES_RECIPIENT", "").strip()
+AWS_REGION    = os.getenv("AWS_REGION", "us-east-1").strip()
+SES_THROTTLE  = float(os.getenv("SES_ALERT_THROTTLE_SECONDS", "60"))
+
+_last_ses_sent: float = 0.0           # epoch seconds of last email sent
+
+# In-memory ring-buffer of the 50 most recent fraud alerts shown on dashboard
+_RECENT_ALERTS: deque = deque(maxlen=50)
+_ses_last_error: str = ""          # last SES error message, surfaced to frontend
+_ses_send_count: int = 0           # successful emails sent this session
+
+
+async def _send_fraud_alert_email(tx_id: str, amount: float, probability: float) -> None:
+    """
+    Send a fraud alert e-mail via AWS SES.
+    Silently skips when SES_SENDER / SES_RECIPIENT are not configured.
+    Enforces a per-process throttle so we don't flood the inbox.
+    """
+    global _last_ses_sent, _ses_last_error, _ses_send_count
+    if not SES_SENDER or not SES_RECIPIENT:
+        return
+
+    now = time.monotonic()
+    if now - _last_ses_sent < SES_THROTTLE:
+        logger.debug("SES throttle active — skipping email for %s", tx_id)
+        return
+
+    recipients = [r.strip() for r in SES_RECIPIENT.split(",") if r.strip()]
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    risk  = "CRITICAL" if probability >= 0.9 else "HIGH"
+    color = "#b91c1c" if probability >= 0.9 else "#dc2626"
+
+    html_body = f"""
+    <div style="font-family:Inter,sans-serif;max-width:560px;margin:0 auto;border:1px solid #fca5a5;border-radius:8px;overflow:hidden">
+      <div style="background:{color};padding:18px 24px">
+        <h2 style="color:#fff;margin:0;font-size:20px">🚨 FraudShield — {risk} Fraud Alert</h2>
+        <p style="color:rgba(255,255,255,0.85);margin:6px 0 0;font-size:13px">{ts}</p>
+      </div>
+      <div style="padding:24px;background:#fff">
+        <table style="width:100%;border-collapse:collapse;font-size:14px">
+          <tr><td style="padding:8px 0;color:#6b7280;width:160px">Transaction ID</td>
+              <td style="padding:8px 0;font-family:monospace;color:#111">{tx_id}</td></tr>
+          <tr><td style="padding:8px 0;color:#6b7280">Amount</td>
+              <td style="padding:8px 0;font-family:monospace;color:#111">${amount:,.2f}</td></tr>
+          <tr><td style="padding:8px 0;color:#6b7280">Fraud Probability</td>
+              <td style="padding:8px 0;font-family:monospace;color:{color};font-weight:700">{probability*100:.1f}%</td></tr>
+          <tr><td style="padding:8px 0;color:#6b7280">Risk Level</td>
+              <td style="padding:8px 0;font-weight:700;color:{color}">{risk}</td></tr>
+        </table>
+        <div style="margin-top:20px;padding:14px;background:#fef2f2;border-radius:6px;font-size:13px;color:#7f1d1d">
+          This transaction has been flagged by the XGBoost model and requires immediate review.
+          Log in to FraudShield to confirm or clear this alert.
+        </div>
+      </div>
+      <div style="padding:12px 24px;background:#f9fafb;font-size:11px;color:#9ca3af">
+        Sent by FraudShield · Automated fraud detection system · Do not reply
+      </div>
+    </div>
+    """
+
+    text_body = (
+        f"FraudShield Fraud Alert\n"
+        f"Transaction: {tx_id}\n"
+        f"Amount:      ${amount:,.2f}\n"
+        f"Probability: {probability*100:.1f}%\n"
+        f"Risk:        {risk}\n"
+        f"Time:        {ts}\n"
+    )
+
+    try:
+        import boto3
+        client = boto3.client(
+            "ses",
+            region_name=AWS_REGION,
+            aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
+            aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
+            aws_session_token=os.getenv("AWS_SESSION_TOKEN"),
+        )
+        await asyncio.to_thread(
+            client.send_email,
+            Source=SES_SENDER,
+            Destination={"ToAddresses": recipients},
+            Message={
+                "Subject": {"Data": f"🚨 Fraud Alert — {tx_id}  ({probability*100:.0f}% confidence)"},
+                "Body": {
+                    "Html": {"Data": html_body},
+                    "Text": {"Data": text_body},
+                },
+            },
+        )
+        _last_ses_sent = now
+        _ses_last_error = ""           # clear any previous error on success
+        _ses_send_count += 1
+        logger.info("SES fraud alert sent for %s to %s (total: %d)", tx_id, recipients, _ses_send_count)
+    except ImportError:
+        _ses_last_error = "boto3 not installed — run: pip install boto3"
+        logger.warning(_ses_last_error)
+    except Exception as exc:
+        # Surface the full error class + message so the Dashboard can display it
+        error_code = getattr(getattr(exc, "response", {}).get("Error", {}), "get", lambda k, d=None: d)("Code", "")
+        if not error_code and hasattr(exc, "response"):
+            error_code = exc.response.get("Error", {}).get("Code", "")
+        _ses_last_error = f"{error_code + ': ' if error_code else ''}{exc}"
+        logger.warning("SES send failed for %s: %s", tx_id, _ses_last_error)
+
+
+def _record_alert(tx_id: str, amount: float, probability: float) -> dict:
+    """Push a fraud alert into the in-memory ring-buffer and return it."""
+    alert = {
+        "tx_id": tx_id,
+        "amount": round(float(amount), 2),
+        "probability": round(float(probability), 4),
+        "risk": "critical" if probability >= 0.9 else "high",
+        "ts": datetime.now(timezone.utc).isoformat(),
+    }
+    _RECENT_ALERTS.appendleft(alert)
+    return alert
 
 # ---------------------------------------------------------------------------
 # App setup
@@ -52,8 +183,7 @@ MODELS_DIR = BASE_DIR / "models"
 HADOOP_OUTPUT_PATH = BASE_DIR / "hadoop-output" / "results.txt"
 KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "").strip()
 KAFKA_STREAM_TOPIC = os.getenv("KAFKA_STREAM_TOPIC", "fraud-transactions").strip()
-KAFKA_STREAM_MAX_MESSAGES = int(os.getenv("KAFKA_STREAM_MAX_MESSAGES", "50"))
-KAFKA_STREAM_IDLE_SECONDS = float(os.getenv("KAFKA_STREAM_IDLE_SECONDS", "8"))
+KAFKA_STREAM_IDLE_SECONDS = float(os.getenv("KAFKA_STREAM_IDLE_SECONDS", "8"))  # legacy, kept for compat
 
 # ---------------------------------------------------------------------------
 # Helper: load dataset (returns None if not available)
@@ -105,8 +235,11 @@ def _get_scalers() -> Dict[str, Any]:
             cols = pd.read_csv(DATA_PATH, usecols=["Amount", "Time"])
             amount_scaler = RobustScaler()
             time_scaler   = StandardScaler()
-            amount_scaler.fit(cols[["Amount"]])
-            time_scaler.fit(cols[["Time"]])
+            # Fit with numpy arrays so sklearn does NOT store feature_names_in_.
+            # This prevents UserWarning at inference time when we pass a plain
+            # numpy array (no feature names) to .transform().
+            amount_scaler.fit(cols["Amount"].to_numpy().reshape(-1, 1))
+            time_scaler.fit(cols["Time"].to_numpy().reshape(-1, 1))
             _SCALER_CACHE = {"amount": amount_scaler, "time": time_scaler}
             logger.info("Scalers fitted from creditcard.csv and cached.")
             return _SCALER_CACHE
@@ -122,7 +255,8 @@ def _get_scalers() -> Dict[str, Any]:
     amount_scaler.center_ = np.array([22.0])
     amount_scaler.scale_  = np.array([71.565])
     amount_scaler.n_features_in_ = 1
-    amount_scaler.feature_names_in_ = None
+    # Do NOT set feature_names_in_ — leaving it absent means sklearn won't
+    # warn when we call .transform() with a plain numpy array at inference.
 
     time_scaler = StandardScaler()
     time_scaler.mean_  = np.array([94813.86])
@@ -130,6 +264,7 @@ def _get_scalers() -> Dict[str, Any]:
     time_scaler.var_   = np.array([47488.15 ** 2])
     time_scaler.n_features_in_ = 1
     time_scaler.n_samples_seen_ = 284807
+    # feature_names_in_ intentionally not set — see amount_scaler note above.
 
     _SCALER_CACHE = {"amount": amount_scaler, "time": time_scaler}
     logger.info("Scalers initialised from hardcoded Kaggle dataset statistics.")
@@ -236,15 +371,20 @@ def _score_stream_transaction(tx: Dict[str, Any], model: Any) -> tuple[int, floa
     return is_fraud, probability
 
 
-async def _try_stream_from_kafka(websocket: WebSocket, model: Any, total: int) -> int:
+async def _try_stream_from_kafka(websocket: WebSocket, model: Any) -> bool:
+    """
+    Continuously consume from Kafka and forward scored transactions over the
+    WebSocket until the client disconnects.  Returns True if Kafka was used,
+    False if Kafka is unavailable (caller should fall back to mock generator).
+    """
     if not KAFKA_BOOTSTRAP_SERVERS:
-        return 0
+        return False
 
     try:
         from kafka import KafkaConsumer
     except Exception as exc:
         logger.info(f"Kafka consumer unavailable: {exc}")
-        return 0
+        return False
 
     try:
         consumer = KafkaConsumer(
@@ -252,53 +392,56 @@ async def _try_stream_from_kafka(websocket: WebSocket, model: Any, total: int) -
             bootstrap_servers=[server.strip() for server in KAFKA_BOOTSTRAP_SERVERS.split(",") if server.strip()],
             auto_offset_reset="latest",
             enable_auto_commit=True,
-            consumer_timeout_ms=1000,
+            consumer_timeout_ms=500,
             group_id=f"fraudshield-stream-{uuid.uuid4().hex[:8]}",
             value_deserializer=lambda value: json.loads(value.decode("utf-8")),
         )
     except Exception as exc:
         logger.warning(f"Could not connect Kafka consumer: {exc}")
-        return 0
+        return False
 
+    logger.info("Kafka consumer connected — streaming continuously until client disconnects")
     received = 0
-    idle_since = asyncio.get_running_loop().time()
 
     try:
-        while received < total:
-            records = await asyncio.to_thread(consumer.poll, timeout_ms=1000, max_records=1)
+        # Run forever; WebSocketDisconnect bubbles up from websocket.send_text
+        while True:
+            records = await asyncio.to_thread(consumer.poll, timeout_ms=500, max_records=5)
             if not records:
-                if asyncio.get_running_loop().time() - idle_since >= KAFKA_STREAM_IDLE_SECONDS:
-                    break
+                # No messages right now — yield to event loop briefly and retry
+                await asyncio.sleep(0.1)
                 continue
 
-            idle_since = asyncio.get_running_loop().time()
             for batch in records.values():
                 for record in batch:
                     tx = record.value or {}
+                    tx_id = tx.get("transaction_id", str(uuid.uuid4()))
+                    amount = float(tx.get("Amount", 0.0))
                     is_fraud, probability = _score_stream_transaction(tx, model)
+
+                    # Record alert + fire email when fraud detected
+                    if is_fraud:
+                        _record_alert(tx_id, amount, probability)
+                        asyncio.create_task(_send_fraud_alert_email(tx_id, amount, probability))
+
+                    received += 1
                     message = {
-                        "transaction_id": tx.get("transaction_id", str(uuid.uuid4())),
-                        "Amount": tx.get("Amount", 0.0),
+                        "transaction_id": tx_id,
+                        "Amount": amount,
                         "is_fraud": is_fraud,
                         "fraud_probability": probability,
                         "risk_level": "high" if probability >= 0.7 else ("medium" if probability >= 0.4 else "low"),
                         "timestamp": tx.get("timestamp", datetime.now(timezone.utc).isoformat()),
-                        "sequence": received + 1,
-                        "total": total,
+                        "sequence": received,
                     }
                     await websocket.send_text(json.dumps(message))
-                    received += 1
-                    if received >= total:
-                        break
-                if received >= total:
-                    break
     finally:
         try:
             consumer.close()
         except Exception:
             pass
 
-    return received
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -675,6 +818,45 @@ async def batch_analytics():
     return _mock_batch_analytics()
 
 
+# ---------------------------------------------------------------------------
+# Alerts endpoint
+# ---------------------------------------------------------------------------
+
+@app.get("/api/alerts", tags=["Alerts"])
+async def get_alerts():
+    """
+    Return the most recent fraud alerts recorded during this server session.
+    Up to 50 alerts are kept in a ring-buffer; oldest are evicted automatically.
+    """
+    return {
+        "alerts": list(_RECENT_ALERTS),
+        "total": len(_RECENT_ALERTS),
+        "ses_configured": bool(SES_SENDER and SES_RECIPIENT),
+        "ses_sender": SES_SENDER or None,
+        "ses_error": _ses_last_error or None,      # last send error, None when clean
+        "ses_send_count": _ses_send_count,          # successful emails this session
+    }
+
+
+@app.post("/api/alerts/test-email", tags=["Alerts"])
+async def test_alert_email():
+    """
+    Send a test fraud alert e-mail via SES to verify configuration.
+    Returns an error message if SES credentials are not configured.
+    """
+    if not SES_SENDER or not SES_RECIPIENT:
+        return {
+            "status": "skipped",
+            "message": (
+                "AWS SES not configured. Set AWS_SES_SENDER and AWS_SES_RECIPIENT "
+                "environment variables to enable email alerts."
+            ),
+        }
+    test_id = f"TEST-{uuid.uuid4().hex[:8].upper()}"
+    await _send_fraud_alert_email(test_id, 999.99, 0.97)
+    return {"status": "sent", "tx_id": test_id, "recipient": SES_RECIPIENT}
+
+
 @app.post("/api/predict", tags=["Prediction"])
 async def predict_transaction(transaction: Dict[str, Any]):
     """
@@ -799,9 +981,11 @@ async def trigger_training_post(background_tasks: BackgroundTasks):
 @app.websocket("/ws/stream")
 async def websocket_stream(websocket: WebSocket):
     """
-    Stream 50 mock transactions to the WebSocket client, one every 0.5 seconds.
-    Each message is a JSON object with:
-        transaction_id, Amount, is_fraud, fraud_probability, timestamp
+    Continuously stream scored transactions to the WebSocket client.
+    Runs until the client disconnects — no artificial cap or stream_end event.
+    Priority: Kafka broker → mock generator (local fallback).
+    Each message: { transaction_id, Amount, is_fraud, fraud_probability,
+                    risk_level, timestamp, sequence }
     """
     await websocket.accept()
     logger.info("WebSocket client connected to /ws/stream")
@@ -812,47 +996,44 @@ async def websocket_stream(websocket: WebSocket):
     model, _model_name = _load_best_model()
 
     try:
-        received = await _try_stream_from_kafka(websocket, model, KAFKA_STREAM_MAX_MESSAGES)
-        if received > 0:
-            await websocket.send_text(json.dumps({"event": "stream_end", "total_sent": received, "source": "kafka"}))
-            return
+        # ── Try Kafka first (runs forever until disconnect) ────────────────────
+        kafka_used = await _try_stream_from_kafka(websocket, model)
+        if kafka_used:
+            return   # client disconnected inside Kafka loop
 
+        # ── Local mock generator fallback ─────────────────────────────────────
+        logger.info("Kafka unavailable — using local mock generator (continuous)")
         from kafka_producer import generate_transaction, _DEMO_FRAUD_RATE
 
         time_offset = random.uniform(0, 86400)
-        # Use demo fraud rate (8 %) so fraud events are visible in the dashboard.
-        # The real Kaggle rate (0.17 %) would produce ~0 fraud in 50 transactions.
         mock_fraud_rate = float(os.getenv("TX_GENERATOR_FRAUD_RATE", str(_DEMO_FRAUD_RATE)))
+        seq = 0
 
-        for i in range(KAFKA_STREAM_MAX_MESSAGES):
+        # Runs until client disconnects (WebSocketDisconnect raised by send_text)
+        while True:
             time_offset += random.uniform(10, 300)
             tx = generate_transaction(time_offset=time_offset, fraud_rate=mock_fraud_rate)
+            tx_id  = tx["transaction_id"]
+            amount = float(tx["Amount"])
             is_fraud, prob = _score_stream_transaction(tx, model)
+            seq += 1
+
+            # Record alert + fire email for every fraud hit
+            if is_fraud:
+                _record_alert(tx_id, amount, prob)
+                asyncio.create_task(_send_fraud_alert_email(tx_id, amount, prob))
 
             message = {
-                "transaction_id": tx["transaction_id"],
-                "Amount": tx["Amount"],
+                "transaction_id": tx_id,
+                "Amount": amount,
                 "is_fraud": is_fraud,
                 "fraud_probability": prob,
                 "risk_level": "high" if prob >= 0.7 else ("medium" if prob >= 0.4 else "low"),
                 "timestamp": tx["timestamp"],
-                "sequence": i + 1,
-                "total": 50,
+                "sequence": seq,
             }
-
             await websocket.send_text(json.dumps(message))
-            await asyncio.sleep(0.5)
-
-        # Signal stream end
-        await websocket.send_text(
-            json.dumps(
-                {
-                    "event": "stream_end",
-                    "total_sent": KAFKA_STREAM_MAX_MESSAGES,
-                    "source": "mock",
-                }
-            )
-        )
+            await asyncio.sleep(0.8)   # ~1.25 tx / second — smooth, not overwhelming
 
     except WebSocketDisconnect:
         logger.info("WebSocket client disconnected from /ws/stream")

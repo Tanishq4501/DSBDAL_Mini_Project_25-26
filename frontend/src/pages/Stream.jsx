@@ -67,7 +67,9 @@ export default function Stream() {
   const [txList, setTxList] = useState(() => lsGet(LS_TX, []))
   const [stats, setStats] = useState(() => lsGet(LS_STATS, { total: 0, fraud: 0, rate: 0 }))
   const [rateHistory, setRateHistory] = useState(() => lsGet(LS_RATE, []))
-  const [speed, setSpeed] = useState(2)
+
+  // Toast notification queue — each entry auto-expires after 7 s
+  const [toasts, setToasts] = useState([])
 
   const intervalRef = useRef(null)
   const wsRef = useRef(null)
@@ -121,17 +123,51 @@ export default function Stream() {
       setRateHistory((history) => [...history, rate].slice(-60))
       return { total: newTotal, fraud: newFraud, rate }
     })
+
+    // Push fraud hits into alerts store + toast queue
+    const fraudHits = batch.filter((t) => t.isFraud)
+    if (fraudHits.length > 0) {
+      // 1️⃣ Persist to localStorage so Dashboard can read them
+      try {
+        const existing = JSON.parse(localStorage.getItem('fraudshield_alerts') || '[]')
+        const newAlerts = fraudHits.map((t) => ({
+          tx_id: t.id,
+          amount: parseFloat(t.amount),
+          probability: t.prob,
+          risk: t.prob >= 0.9 ? 'critical' : 'high',
+          ts: new Date().toISOString(),
+        }))
+        const merged = [...newAlerts, ...existing].slice(0, 50)
+        localStorage.setItem('fraudshield_alerts', JSON.stringify(merged))
+      } catch {}
+
+      // 2️⃣ Push toast notifications — keep max 4 visible at once
+      const newToasts = fraudHits.map((t) => ({
+        id: `${Date.now()}-${Math.random()}`,
+        tx_id: t.id,
+        amount: t.amount,
+        prob: t.prob,
+        isCrit: t.prob >= 0.9,
+      }))
+      setToasts((prev) => [...newToasts, ...prev].slice(0, 4))
+
+      // 3️⃣ Auto-dismiss each toast after 7 s
+      newToasts.forEach((toast) => {
+        setTimeout(() => {
+          setToasts((prev) => prev.filter((t) => t.id !== toast.id))
+        }, 7000)
+      })
+    }
   }, [])
 
+  // Continuous local fallback: 1 transaction every 800 ms
   const startLocalInterval = useCallback(() => {
     clearLocalInterval()
     setStreamSource('local')
     intervalRef.current = setInterval(() => {
-      const count = Math.floor(Math.random() * 3) + 1
-      const batch = Array.from({ length: count }, generateTx)
-      ingestBatch(batch)
-    }, speed * 1000)
-  }, [clearLocalInterval, generateTx, ingestBatch, speed])
+      ingestBatch([generateTx()])
+    }, 800)
+  }, [clearLocalInterval, generateTx, ingestBatch])
 
   const stopStream = useCallback(() => {
     streamingRef.current = false
@@ -189,10 +225,8 @@ export default function Stream() {
       ws.onmessage = (event) => {
         try {
           const payload = JSON.parse(event.data)
-          if (payload.event === 'stream_end') {
-            stopStream()
-            return
-          }
+          // Ignore server-sent control events (error pings, etc.)
+          if (payload.event) return
 
           const batch = (Array.isArray(payload) ? payload : [payload])
             .map((record) => normalizeTransaction(record, seqRef))
@@ -232,7 +266,6 @@ export default function Stream() {
     if (streaming && streamSource === 'local') {
       startLocalInterval()
     }
-
     return () => clearLocalInterval()
   }, [clearLocalInterval, startLocalInterval, streamSource, streaming])
 
@@ -336,6 +369,68 @@ export default function Stream() {
 
   return (
     <div style={{ padding: '32px 32px 48px', background: 'var(--bg-base)', minHeight: '100vh' }}>
+
+      {/* ── Toast notification stack ── fixed top-right, z above everything ── */}
+      <div style={{
+        position: 'fixed', top: 80, right: 24, zIndex: 9999,
+        display: 'flex', flexDirection: 'column', gap: 10,
+        pointerEvents: 'none',
+      }}>
+        {toasts.map((t) => (
+          <div
+            key={t.id}
+            style={{
+              pointerEvents: 'auto',
+              width: 320,
+              background: t.isCrit ? '#7f1d1d' : '#1a0a0a',
+              border: `1.5px solid ${t.isCrit ? '#fca5a5' : '#f87171'}`,
+              borderRadius: 10,
+              padding: '14px 16px',
+              boxShadow: '0 8px 32px rgba(225,29,72,0.35)',
+              animation: 'slideInRight 0.25s ease',
+              display: 'flex',
+              gap: 12,
+              alignItems: 'flex-start',
+            }}
+          >
+            {/* icon */}
+            <div style={{
+              width: 34, height: 34, borderRadius: 8, flexShrink: 0,
+              background: 'rgba(225,29,72,0.25)',
+              display: 'flex', alignItems: 'center', justifyContent: 'center',
+              fontSize: 16,
+            }}>🚨</div>
+            <div style={{ flex: 1 }}>
+              <div style={{ fontSize: 12, fontWeight: 800, color: '#fca5a5', letterSpacing: '0.05em', marginBottom: 2 }}>
+                {t.isCrit ? 'CRITICAL FRAUD DETECTED' : 'FRAUD DETECTED'}
+              </div>
+              <div className="mono" style={{ fontSize: 13, color: '#fff', fontWeight: 700, marginBottom: 4 }}>
+                {t.tx_id}
+              </div>
+              <div style={{ display: 'flex', gap: 12, fontSize: 12 }}>
+                <span style={{ color: '#fcd34d' }}>${Number(t.amount).toFixed(2)}</span>
+                <span style={{ color: '#f87171' }}>{(t.prob * 100).toFixed(1)}% confidence</span>
+              </div>
+            </div>
+            <button
+              onClick={() => setToasts((prev) => prev.filter((x) => x.id !== t.id))}
+              style={{
+                background: 'none', border: 'none', color: '#fca5a5',
+                cursor: 'pointer', fontSize: 16, lineHeight: 1, padding: '2px 4px',
+                flexShrink: 0,
+              }}
+            >×</button>
+          </div>
+        ))}
+      </div>
+
+      <style>{`
+        @keyframes slideInRight {
+          from { opacity: 0; transform: translateX(60px); }
+          to   { opacity: 1; transform: translateX(0); }
+        }
+      `}</style>
+
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 24 }}>
         <div>
           <div className="overline" style={{ marginBottom: 6 }}>// KAFKA + WEBSOCKET</div>
@@ -369,59 +464,65 @@ export default function Stream() {
           flexWrap: 'wrap',
         }}
       >
+        {/* Start / Stop — the only stream control */}
         <button
           onClick={streaming ? stopStream : startStream}
           className={streaming ? 'btn-ghost' : 'btn-primary'}
-          style={{ flexShrink: 0 }}
-        >
-          {streaming ? 'Stop Stream' : 'Start Stream'}
-        </button>
-
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexShrink: 0 }}>
-          <span style={{ fontSize: 13, color: 'var(--text-secondary)' }}>Batch interval:</span>
-          <button
-            onClick={() => setSpeed((value) => Math.max(1, value - 1))}
-            className="btn-ghost"
-            style={{ width: 28, height: 28, padding: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 16 }}
-          >
-            -
-          </button>
-          <span className="mono" style={{ fontSize: 14, color: 'var(--text-primary)', minWidth: 24, textAlign: 'center' }}>
-            {speed}s
-          </span>
-          <button
-            onClick={() => setSpeed((value) => Math.min(10, value + 1))}
-            className="btn-ghost"
-            style={{ width: 28, height: 28, padding: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 16 }}
-          >
-            +
-          </button>
-        </div>
-
-        {/* Clear history button */}
-        <button
-          onClick={clearHistory}
-          disabled={streaming}
-          className="btn-ghost"
-          title="Clear all persisted transaction history"
           style={{
             flexShrink: 0,
-            opacity: streaming ? 0.4 : 1,
-            fontSize: 12,
             display: 'flex',
             alignItems: 'center',
-            gap: 5,
+            gap: 7,
+            minWidth: 130,
+            justifyContent: 'center',
           }}
         >
-          {/* trash icon */}
-          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-            <polyline points="3 6 5 6 21 6" />
-            <path d="M19 6l-1 14H6L5 6" />
-            <path d="M10 11v6M14 11v6" />
-            <path d="M9 6V4h6v2" />
-          </svg>
-          Clear
+          {streaming ? (
+            <>
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor">
+                <rect x="6" y="4" width="4" height="16" rx="1" />
+                <rect x="14" y="4" width="4" height="16" rx="1" />
+              </svg>
+              Stop Stream
+            </>
+          ) : (
+            <>
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor">
+                <polygon points="5 3 19 12 5 21 5 3" />
+              </svg>
+              Start Stream
+            </>
+          )}
         </button>
+
+        {/* Continuous indicator — visible while running */}
+        {streaming && (
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, color: 'var(--text-muted)' }}>
+            <span
+              className="pulse-dot"
+              style={{ width: 7, height: 7, borderRadius: '50%', background: 'var(--success)', display: 'inline-block' }}
+            />
+            <span>Streaming continuously</span>
+          </div>
+        )}
+
+        {/* Clear history — only when stopped */}
+        {!streaming && (
+          <button
+            onClick={clearHistory}
+            className="btn-ghost"
+            title="Clear all persisted transaction history"
+            style={{ flexShrink: 0, fontSize: 12, display: 'flex', alignItems: 'center', gap: 5 }}
+          >
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <polyline points="3 6 5 6 21 6" />
+              <path d="M19 6l-1 14H6L5 6" />
+              <path d="M10 11v6M14 11v6" />
+              <path d="M9 6V4h6v2" />
+            </svg>
+            Clear History
+          </button>
+        )}
 
         <div style={{ display: 'flex', gap: 16, marginLeft: 'auto', flexWrap: 'wrap' }}>
           <StatChip label="PROCESSED" value={stats.total} color="var(--accent-primary)" />
@@ -431,6 +532,50 @@ export default function Stream() {
           <StatChip label="SOURCE" value={streamLabel.toUpperCase()} color={streamSource === 'local' ? 'var(--warning)' : 'var(--accent-primary)'} />
         </div>
       </div>
+
+      {/* ── Inline fraud alert ticker (only visible when fraud has hit) ── */}
+      {txList.some((t) => t.isFraud) && (
+        <div style={{
+          marginBottom: 16,
+          padding: '10px 16px',
+          background: 'rgba(225,29,72,0.07)',
+          border: '1px solid rgba(225,29,72,0.25)',
+          borderLeft: '4px solid #e11d48',
+          borderRadius: 8,
+          display: 'flex',
+          alignItems: 'center',
+          gap: 14,
+          flexWrap: 'wrap',
+        }}>
+          <span style={{ fontSize: 16 }}>🚨</span>
+          <div>
+            <span style={{ fontSize: 13, fontWeight: 700, color: '#e11d48' }}>
+              {txList.filter((t) => t.isFraud).length} fraud transaction{txList.filter((t) => t.isFraud).length !== 1 ? 's' : ''} detected
+            </span>
+            <span style={{ fontSize: 12, color: 'var(--text-muted)', marginLeft: 10 }}>
+              in current session · check table below
+            </span>
+          </div>
+          {/* Most recent fraud tx */}
+          {(() => {
+            const last = txList.find((t) => t.isFraud)
+            if (!last) return null
+            return (
+              <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 10 }}>
+                <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>Latest:</span>
+                <span className="mono" style={{ fontSize: 12, fontWeight: 700, color: '#e11d48' }}>{last.id}</span>
+                <span className="mono" style={{ fontSize: 12, color: 'var(--text-secondary)' }}>${last.amount}</span>
+                <span
+                  className="badge badge-danger"
+                  style={{ fontSize: 11 }}
+                >
+                  {(last.prob * 100).toFixed(1)}%
+                </span>
+              </div>
+            )
+          })()}
+        </div>
+      )}
 
       <div style={{ display: 'grid', gridTemplateColumns: '65fr 35fr', gap: 20 }}>
         <div className="glow-card" style={{ padding: 0, overflow: 'hidden' }}>

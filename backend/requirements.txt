@@ -12,4 +12,5 @@ plotly==5.15.0
 kafka-python==2.0.2
 websockets==12.0
 python-multipart==0.0.6
+boto3>=1.28.0
 # NOTE: pyspark is intentionally excluded from Docker — install locally or use Google Colab

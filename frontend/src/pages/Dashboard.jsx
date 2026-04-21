@@ -1,5 +1,263 @@
 import { useEffect, useRef, useState } from 'react'
 
+// ── helpers ──────────────────────────────────────────────────────────────────
+function lsGet(key, fallback) {
+  try { const r = localStorage.getItem(key); return r ? JSON.parse(r) : fallback }
+  catch { return fallback }
+}
+
+function AlertsPanel() {
+  const [alerts, setAlerts]     = useState(() => lsGet('fraudshield_alerts', []))
+  const [sesOk, setSesOk]       = useState(null)   // null=loading, true/false
+  const [sesError, setSesError] = useState(null)   // last SES error string | null
+  const [sesSent, setSesSent]   = useState(0)      // successful emails this session
+  const [lastCount, setLastCount] = useState(0)
+  const [flash, setFlash]       = useState(false)
+
+  // Poll /api/alerts every 5 s — uses SERVER-SIDE ring buffer (populated by WS stream)
+  // and falls back to localStorage when backend is unreachable.
+  useEffect(() => {
+    function load() {
+      fetch('/api/alerts')
+        .then((r) => r.json())
+        .then((d) => {
+          setSesOk(d.ses_configured ?? false)
+          setSesError(d.ses_error ?? null)
+          setSesSent(d.ses_send_count ?? 0)
+
+          // Merge server alerts + localStorage alerts, deduplicate by tx_id
+          const serverAlerts = Array.isArray(d.alerts) ? d.alerts : []
+          const lsAlerts     = lsGet('fraudshield_alerts', [])
+          const seen         = new Set()
+          const merged       = [...serverAlerts, ...lsAlerts]
+            .filter((a) => {
+              if (seen.has(a.tx_id)) return false
+              seen.add(a.tx_id)
+              return true
+            })
+            .slice(0, 50)
+
+          setAlerts((prev) => {
+            if (merged.length > prev.length) {
+              setFlash(true)
+              setTimeout(() => setFlash(false), 1200)
+            }
+            setLastCount(merged.length)
+            return merged
+          })
+        })
+        .catch(() => {
+          setSesOk(false)
+          setAlerts(lsGet('fraudshield_alerts', []))
+        })
+    }
+
+    load()
+    const id = setInterval(load, 5000)
+    return () => clearInterval(id)
+  }, [])
+
+  const fmt = (iso) => {
+    try { return new Date(iso).toLocaleTimeString('en', { hour12: false }) }
+    catch { return '—' }
+  }
+
+  return (
+    <div
+      className="glow-card"
+      style={{
+        padding: 20,
+        border: flash ? '1.5px solid #e11d48' : '1px solid var(--border-subtle)',
+        transition: 'border-color 0.3s ease',
+        boxShadow: flash ? '0 0 0 3px rgba(225,29,72,0.12)' : undefined,
+      }}
+    >
+      {/* header */}
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+          <div>
+            <div style={{ fontSize: 15, fontWeight: 700, color: 'var(--text-primary)', display: 'flex', alignItems: 'center', gap: 8 }}>
+              🚨 Live Fraud Alerts
+              {alerts.length > 0 && (
+                <span style={{
+                  background: '#e11d48', color: '#fff', fontSize: 11, fontWeight: 700,
+                  padding: '1px 7px', borderRadius: 99, fontFamily: "'JetBrains Mono', monospace",
+                }}>
+                  {alerts.length}
+                </span>
+              )}
+            </div>
+            <div className="overline" style={{ marginTop: 2 }}>// POLLED FROM BACKEND + SESSION · AUTO-REFRESH 5s</div>
+          </div>
+        </div>
+        {/* SES badge */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 4 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
+              <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>SES email:</span>
+              {sesOk === null ? (
+                <span className="badge" style={{ background: 'var(--bg-elevated)', color: 'var(--text-muted)', border: '1px solid var(--border-subtle)', fontSize: 10 }}>checking…</span>
+              ) : sesOk && !sesError ? (
+                <span className="badge badge-success" style={{ fontSize: 10 }}>
+                  ✓ ON {sesSent > 0 ? `· ${sesSent} sent` : ''}
+                </span>
+              ) : sesOk && sesError ? (
+                <span className="badge badge-danger" style={{ fontSize: 10 }} title={sesError}>
+                  ✗ ERROR
+                </span>
+              ) : (
+                <span className="badge badge-warning" style={{ fontSize: 10 }}
+                  title="Set AWS_SES_SENDER + AWS_SES_RECIPIENT env vars in docker-compose.yml">
+                  ⚠ NOT CONFIGURED
+                </span>
+              )}
+            </div>
+            {/* Show the specific SES error inline */}
+            {sesError && (
+              <div style={{
+                fontSize: 10, color: '#e11d48', maxWidth: 260,
+                fontFamily: "'JetBrains Mono', monospace",
+                textAlign: 'right', lineHeight: 1.4,
+              }}
+                title={sesError}
+              >
+                {sesError.length > 60 ? sesError.slice(0, 57) + '…' : sesError}
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+
+      {/* SES error panel — shown for both "not configured" and "credentials wrong" */}
+      {(sesOk === false || sesError) && (
+        <div style={{
+          marginBottom: 14, padding: '12px 14px',
+          background: sesError ? 'rgba(225,29,72,0.06)' : 'rgba(217,119,6,0.07)',
+          border: `1px solid ${sesError ? 'rgba(225,29,72,0.25)' : 'rgba(217,119,6,0.25)'}`,
+          borderLeft: `3px solid ${sesError ? '#e11d48' : '#d97706'}`,
+          borderRadius: 6,
+        }}>
+          {sesError ? (
+            <>
+              <div style={{ fontSize: 12, fontWeight: 700, color: '#e11d48', marginBottom: 6 }}>
+                ✗ SES send error — credentials or permissions issue
+              </div>
+              <div style={{
+                fontSize: 11, fontFamily: "'JetBrains Mono', monospace",
+                color: '#e11d48', background: 'rgba(225,29,72,0.08)',
+                padding: '6px 10px', borderRadius: 4, marginBottom: 8, wordBreak: 'break-word',
+              }}>
+                {sesError}
+              </div>
+              <div style={{ fontSize: 11, color: 'var(--text-muted)', lineHeight: 1.7 }}>
+                <strong>InvalidClientTokenId</strong> → Your <code style={{ background: 'rgba(0,0,0,0.06)', padding: '1px 4px', borderRadius: 3 }}>AWS_ACCESS_KEY_ID</code> is invalid or expired.<br />
+                <strong>Fix:</strong> Generate a new access key in <em>AWS Console → IAM → Users → Security credentials</em> and update <code style={{ background: 'rgba(0,0,0,0.06)', padding: '1px 4px', borderRadius: 3 }}>docker-compose.yml</code>.<br />
+                <strong>Also check:</strong> IAM user must have <code style={{ background: 'rgba(0,0,0,0.06)', padding: '1px 4px', borderRadius: 3 }}>ses:SendEmail</code> permission, and sender address must be <em>verified</em> in SES.
+              </div>
+            </>
+          ) : (
+            <>
+              <div style={{ fontSize: 12, fontWeight: 700, color: '#d97706', marginBottom: 4 }}>
+                ⚠ Email alerts disabled — AWS SES not configured
+              </div>
+              <div style={{ fontSize: 11, color: 'var(--text-muted)', lineHeight: 1.6, marginBottom: 6 }}>
+                Add these to <code style={{ background: 'rgba(0,0,0,0.06)', padding: '1px 4px', borderRadius: 3 }}>docker-compose.yml</code> backend environment, then rebuild:
+              </div>
+              <pre style={{
+                margin: 0, fontSize: 10, color: 'var(--text-secondary)',
+                background: 'rgba(0,0,0,0.04)', padding: '8px 10px', borderRadius: 5,
+                fontFamily: "'JetBrains Mono', monospace", overflowX: 'auto',
+              }}>{`AWS_SES_SENDER: "alerts@yourdomain.com"
+AWS_SES_RECIPIENT: "analyst@yourdomain.com"
+AWS_REGION: "us-east-1"
+AWS_ACCESS_KEY_ID: "AKIA..."
+AWS_SECRET_ACCESS_KEY: "..."`}</pre>
+            </>
+          )}
+        </div>
+      )}
+
+      {alerts.length === 0 ? (
+        <div style={{ padding: '24px 0', textAlign: 'center', color: 'var(--text-muted)', fontSize: 13 }}>
+          <div style={{ fontSize: 28, marginBottom: 8 }}>🛡</div>
+          <div style={{ fontWeight: 600, marginBottom: 4 }}>No fraud alerts yet</div>
+          <div>Go to <strong>Live Stream</strong> → <strong>Start Stream</strong> to begin monitoring.</div>
+          <div style={{ marginTop: 6, fontSize: 11, opacity: 0.7 }}>This panel auto-refreshes every 5 seconds from the backend.</div>
+        </div>
+      ) : (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 8, maxHeight: 280, overflowY: 'auto' }}>
+          {alerts.map((a, i) => {
+            const isCrit = a.risk === 'critical' || a.probability >= 0.9
+            const border  = isCrit ? '#7f1d1d' : '#e11d48'
+            const bg      = isCrit ? 'rgba(127,29,29,0.08)' : 'rgba(225,29,72,0.05)'
+            const probPct = (a.probability * 100).toFixed(1)
+            return (
+              <div
+                key={a.tx_id + i}
+                style={{
+                  display: 'grid',
+                  gridTemplateColumns: '1fr auto auto auto',
+                  alignItems: 'center',
+                  gap: 12,
+                  padding: '10px 14px',
+                  background: bg,
+                  border: `1px solid ${border}33`,
+                  borderLeft: `3px solid ${border}`,
+                  borderRadius: 6,
+                }}
+              >
+                <div>
+                  <div className="mono" style={{ fontSize: 12, fontWeight: 700, color: 'var(--text-primary)' }}>
+                    {a.tx_id}
+                  </div>
+                  <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 2 }}>{fmt(a.ts)}</div>
+                </div>
+                <div className="mono" style={{ fontSize: 13, color: 'var(--text-secondary)' }}>
+                  ${Number(a.amount).toFixed(2)}
+                </div>
+                <div style={{ textAlign: 'right' }}>
+                  <div className="mono" style={{ fontSize: 13, fontWeight: 700, color: border }}>{probPct}%</div>
+                  <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>probability</div>
+                </div>
+                <span
+                  className="badge"
+                  style={{
+                    fontSize: 10,
+                    fontWeight: 700,
+                    background: isCrit ? 'rgba(127,29,29,0.15)' : 'rgba(225,29,72,0.10)',
+                    color: border,
+                    border: `1px solid ${border}44`,
+                  }}
+                >
+                  {isCrit ? 'CRITICAL' : 'HIGH'}
+                </span>
+              </div>
+            )
+          })}
+        </div>
+      )}
+
+      {alerts.length > 0 && (
+        <div style={{ marginTop: 12, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+          <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>
+            {alerts.length} alert{alerts.length !== 1 ? 's' : ''} in session
+          </span>
+          <button
+            onClick={() => {
+              localStorage.removeItem('fraudshield_alerts')
+              setAlerts([])
+            }}
+            className="btn-ghost"
+            style={{ fontSize: 11, padding: '4px 10px' }}
+          >
+            Clear Alerts
+          </button>
+        </div>
+      )}
+    </div>
+  )
+}
+
 export default function Dashboard() {
   const [time, setTime] = useState(new Date().toLocaleTimeString('en', { hour12: false }))
   const pieRef = useRef(null)
@@ -366,6 +624,11 @@ export default function Dashboard() {
             ))}
           </div>
         </div>
+      </div>
+
+      {/* Live Fraud Alerts */}
+      <div style={{ marginTop: 20 }}>
+        <AlertsPanel />
       </div>
 
       {/* Accuracy Paradox Card */}

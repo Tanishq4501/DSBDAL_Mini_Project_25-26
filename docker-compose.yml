@@ -239,8 +239,15 @@ services:
     environment:
       KAFKA_BOOTSTRAP_SERVERS: kafka:19092
       KAFKA_STREAM_TOPIC: fraud-transactions
-      KAFKA_STREAM_MAX_MESSAGES: "50"
-      KAFKA_STREAM_IDLE_SECONDS: "8"
+      # ── AWS SES email alerts ──────────────────────────────────────────────
+      # Uncomment and fill in to enable fraud alert emails via AWS SES.
+      # The sender address must be verified in your SES account.
+      AWS_SES_SENDER: "${AWS_SES_SENDER:-tanishqchoudhary5689@gmail.com}"
+      AWS_SES_RECIPIENT: "${AWS_SES_RECIPIENT:-tanishqchoudhary5689@gmail.com}"
+      AWS_REGION: "${AWS_REGION:-ap-south-1}"
+      AWS_ACCESS_KEY_ID: "${AWS_ACCESS_KEY_ID:-AKIA2JDPC72HWX65OLSR}"
+      AWS_SECRET_ACCESS_KEY: "${AWS_SECRET_ACCESS_KEY:-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}"
+      SES_ALERT_THROTTLE_SECONDS: "60"
     volumes:
       - ./backend/data:/app/data
       - ./backend/models:/app/models
